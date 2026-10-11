@@ -653,6 +653,51 @@ def cmd_stop(_: argparse.Namespace) -> None:
     print("监控已停止。")
 
 
+def health_report() -> tuple[bool, list[str]]:
+    """巡检：进程在不在跑、数据是不是还在更新、最近有没有报错。返回 (是否正常, 说明)。"""
+    cfg = load_config()
+    st = load_state()
+    interval = max(MIN_INTERVAL, int(cfg.get("interval", 60)))
+    stale_after = max(5 * interval, BLOCK_COOLDOWN + 5 * interval)  # 被拦截会停 15 分钟，留出余量
+    problems: list[str] = []
+    notes: list[str] = []
+    pid = running_pid()
+    if pid:
+        notes.append(f"进程在运行（{pid}）")
+    else:
+        problems.append("监控进程没有在运行")
+    last_ok = st.get("last_ok_at")
+    if not last_ok:
+        problems.append("还没有成功查到过数据")
+    else:
+        age = (datetime.now() - datetime.strptime(last_ok, "%Y-%m-%d %H:%M:%S")).total_seconds()
+        if age > stale_after:
+            problems.append(f"数据已经 {int(age // 60)} 分钟没更新（上次 {last_ok}）")
+        else:
+            notes.append(f"数据在更新（上次 {last_ok}）")
+    if st.get("last_error") and st.get("fail_count", 0) >= 3:
+        problems.append(f"连续 {st['fail_count']} 次查不到：{st['last_error']}")
+    try:
+        tail = (home() / "watch.log").read_text(encoding="utf-8").splitlines()[-200:]
+    except OSError:
+        tail = []
+    push_fail = [ln for ln in tail if "推送失败" in ln or "本机通知失败" in ln]
+    if push_fail:
+        problems.append(f"最近有 {len(push_fail)} 次通知发送失败：{push_fail[-1][22:][:60]}")
+    else:
+        notes.append("通知没有报错")
+    return (not problems), (problems or notes)
+
+
+def cmd_health(a: argparse.Namespace) -> None:
+    ok, lines = health_report()
+    print(("正常：" if ok else "异常：") + "；".join(lines))
+    if not ok:
+        if a.alert:
+            notify(load_config(), "库存监控需要看一下", "；".join(lines), urgent=False)
+        sys.exit(2)
+
+
 def cmd_status(_: argparse.Namespace) -> None:
     cfg = load_config()
     st = load_state()
@@ -847,6 +892,10 @@ def main() -> None:
     p.add_argument("--buy-url", help="通知里附带的购买链接")
     p.add_argument("--no-local-notify", action="store_true")
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("health", help="巡检：进程、数据更新、通知是否正常；异常时退出码为 2")
+    p.add_argument("--alert", action="store_true", help="异常时往手机推一条提醒")
+    p.set_defaults(fn=cmd_health)
 
     for name, fn, hlp in [
         ("check", cmd_check, "立刻查一次"),
