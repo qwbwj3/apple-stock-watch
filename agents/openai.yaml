@@ -1,0 +1,6 @@
+interface:
+  display_name: "Apple 库存监控"
+  short_description: "盯 Apple Store 门店取货库存，有货推到手机；只提醒不下单"
+  default_prompt: "用 $apple-stock-watch 帮我盯 iPhone Duo 的门店库存，有货就通知我。"
+policy:
+  allow_implicit_invocation: true
