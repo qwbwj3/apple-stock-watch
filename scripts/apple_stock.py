@@ -54,7 +54,7 @@ class QueryError(Exception):
 
 def home() -> Path:
     p = Path(os.environ.get("APPLE_STOCK_WATCH_HOME", Path.home() / ".apple-stock-watch"))
-    p.mkdir(parents=True, exist_ok=True, mode=0o700)
+    p.mkdir(parents=True, exist_ok=True)
     return p
 
 
@@ -420,16 +420,6 @@ def mask(secret: str) -> str:
 
 # ---------- 通知 ----------
 
-def audit(event: str, **fields) -> None:
-    # Public inventory/timing and delivery verdicts only. Never URLs or credentials.
-    entry = {"event": event, "at_ms": int(time.time() * 1000), **fields}
-    path = home() / "events.jsonl"
-    if path.exists() and path.stat().st_size > 512 * 1024:
-        path.replace(path.with_suffix(".jsonl.1"))
-    with path.open("a", encoding="utf-8") as output:
-        output.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
 def notify(cfg: dict, title: str, body: str, url: str = "", urgent: bool = True) -> list[str]:
     """发通知，返回成功的渠道名。任何渠道失败都不抛异常。"""
     sent: list[str] = []
@@ -450,13 +440,10 @@ def notify(cfg: dict, title: str, body: str, url: str = "", urgent: bool = True)
             headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                reply = json.loads(resp.read(65536))
-                if 200 <= resp.status < 300 and isinstance(reply, dict) and reply.get("code") == 200:
+                if 200 <= resp.status < 300:
                     sent.append("Bark")
-                else:
-                    log("Bark 推送失败：服务未确认接收")
         except Exception as e:  # noqa: BLE001 通知失败不能中断监控
-            log(f"Bark 推送失败：{type(e).__name__}")
+            log(f"Bark 推送失败：{e}")
     if sys.platform == "darwin" and cfg.get("local_notify", True) and shutil.which("osascript"):
         script = "display notification {} with title {}{}".format(
             json.dumps(body, ensure_ascii=False), json.dumps(title, ensure_ascii=False),
@@ -467,7 +454,6 @@ def notify(cfg: dict, title: str, body: str, url: str = "", urgent: bool = True)
             sent.append("本机通知")
         except Exception as e:  # noqa: BLE001
             log(f"本机通知失败：{e}")
-    audit("notification", title=title, channels=sent, bark_accepted="Bark" in sent)
     return sent
 
 
@@ -494,15 +480,6 @@ def save_state(st: dict) -> None:
 
 
 def check_once(cfg: dict) -> list[dict]:
-    source = cfg.get("source", "direct")
-    if source == "public_cache":
-        from public_cache import query, CacheError
-        try:
-            return query(cfg)
-        except CacheError as exc:
-            raise QueryError(str(exc)) from None
-    if source != "direct":
-        raise QueryError("未知库存来源，未回退直查官网")
     parts = list(cfg["parts"].keys())
     wanted = [n.upper() for n in (cfg.get("stores") or [])]
     stores: list[dict] = []
@@ -535,27 +512,8 @@ def summarize(stores: list[dict], names: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def flush_notices(cfg: dict, notices: list) -> list[str]:
-    """One bounded Bark call per cache poll, including recovery/stock changes."""
-    if not notices:
-        return []
-    if len(notices) == 1:
-        title, body, url, urgent = notices[0]
-    else:
-        urgent = any(n[3] for n in notices)
-        stock = [n for n in notices if n[2]]
-        title = (stock[0][0] if len(stock) == 1 else "有货：多项配置") if stock else "门店库存状态更新"
-        body = "\n\n".join(n[0] + "\n" + n[1] for n in notices)
-        url = stock[0][2] if stock else ""
-    return notify(cfg, title, body, url=url, urgent=urgent)
-
-
 def watch(cfg: dict) -> None:
     interval = max(MIN_INTERVAL, int(cfg.get("interval", 60)))
-    cached_source = cfg.get("source") == "public_cache"
-    if cached_source:
-        interval = max(60, interval)
-    deadline = time.monotonic() if cached_source else None
     names: dict[str, str] = cfg["parts"]
     buy_url = cfg.get("buy_url") or BASE + "/shop/buy-iphone"
     st = load_state()
@@ -568,24 +526,13 @@ def watch(cfg: dict) -> None:
     where = cfg.get("location") or "、".join(cfg.get("cities") or []) or "指定门店"
     log(f"开始监控：{where}，{len(names)} 个型号，每 {interval} 秒查一次")
 
-    notices = []
-
-    def emit(title, body, url="", urgent=True):
-        if cached_source:
-            notices.append((title, body, url, urgent))
-            return []
-        return notify(cfg, title, body, url=url, urgent=urgent)
-
     while True:
-        notices.clear()
         tick = time.time()
-        audit("poll_start", source=cfg.get("source", "direct"))
         blocked = False
         try:
             stores = check_once(cfg)
         except QueryError as e:
-            audit("poll_error", reason=str(e))
-            blocked = not cached_source and "541" in str(e)
+            blocked = "541" in str(e)
             fail_count += 1
             fail_since = fail_since or tick
             log(f"查不到（第 {fail_count} 次）：{e}")
@@ -594,13 +541,13 @@ def watch(cfg: dict) -> None:
             if (fail_count >= 3 and tick - fail_since >= 600
                     and tick - last_health_alert >= 3600):
                 mins = int((tick - fail_since) / 60)
-                emit("库存监控查不到数据", f"已经 {mins} 分钟查不到，原因：{e}。这段时间有没有货我不知道。",
+                notify(cfg, "库存监控查不到数据", f"已经 {mins} 分钟查不到，原因：{e}。这段时间有没有货我不知道。",
                        urgent=False)
                 last_health_alert = tick
                 health_alerted = True
         else:
             if health_alerted:
-                emit("库存监控恢复正常", "又能查到数据了。", urgent=False)
+                notify(cfg, "库存监控恢复正常", "又能查到数据了。", urgent=False)
             fail_since, fail_count, health_alerted = None, 0, False
             new_hits: list[tuple[dict, str, dict]] = []
             counts = {"available": 0, "unavailable": 0, "ineligible": 0, "unknown": 0}
@@ -611,25 +558,21 @@ def watch(cfg: dict) -> None:
                     prev = pairs.get(key, {})
                     cur = dict(prev)
                     if info["state"] == "available":
-                        if not prev.get("on") or prev.get("alert_pending"):
-                            cur = {"on": True, "since": prev.get("since", tick), "miss": 0,
-                                   "alert_pending": True}
+                        if not prev.get("on"):
+                            cur = {"on": True, "since": tick, "miss": 0}
                             new_hits.append((s, p, info))
                         else:
                             cur["miss"] = 0
                     elif info["state"] in ("unavailable", "ineligible"):
-                        fresh_observation = not cached_source or info["last_checked_ms"] != prev.get("observed_ms")
-                        if prev.get("on") and fresh_observation:
+                        if prev.get("on"):
                             cur["miss"] = prev.get("miss", 0) + 1
                             if cur["miss"] >= 2:
                                 mins = max(1, int((tick - prev.get("since", tick)) / 60))
                                 name = names.get(p) or info["title"] or p
-                                emit("没货了", f"{s['city']} {s['name']} 的 {name} 已经没货，这次放货持续约 {mins} 分钟。",
+                                notify(cfg, "没货了", f"{s['city']} {s['name']} 的 {name} 已经没货，这次放货持续约 {mins} 分钟。",
                                        urgent=False)
                                 log(f"没货了：{s['name']} {name}（持续约 {mins} 分钟）")
                                 cur = {"on": False}
-                    if cached_source:
-                        cur["observed_ms"] = info["last_checked_ms"]
                     # unknown：保持原状态，不当成无货
                     pairs[key] = cur
             if len(new_hits) > 5:
@@ -638,32 +581,15 @@ def watch(cfg: dict) -> None:
                     by_model.setdefault(names.get(p) or info["title"] or p, []).append(s["name"])
                 body = "\n".join(f"{m}：{'、'.join(v)}" for m, v in by_model.items())
                 head = "现在就有货" if first_ok else "大量放货"
-                sent = emit(f"{head}：{len(new_hits)} 处", body, url=buy_url)
-                delivered = "Bark" in sent if cfg.get("bark") else bool(sent)
-                for hit_store, hit_part, _ in new_hits:
-                    pairs[f"{hit_store['number']}|{hit_part}"]["alert_pending"] = not delivered
+                notify(cfg, f"{head}：{len(new_hits)} 处", body, url=buy_url)
                 log(f"{head}：{len(new_hits)} 处")
             else:
                 for s, p, info in new_hits:
                     name = names.get(p) or info["title"] or p
                     quote = info["quote"] or "可取货"
-                    sent = emit(f"有货：{name}", f"{s['city']} {s['name']}，{quote}。点开直接去买。", url=buy_url)
-                    delivered = "Bark" in sent if cfg.get("bark") else bool(sent)
-                    pairs[f"{s['number']}|{p}"]["alert_pending"] = not delivered
+                    notify(cfg, f"有货：{name}", f"{s['city']} {s['name']}，{quote}。点开直接去买。", url=buy_url)
                     log(f"有货：{s['city']} {s['name']} {name}（{quote}）")
-            if cached_source:
-                sent = flush_notices(cfg, notices)
-                delivered = "Bark" in sent if cfg.get("bark") else bool(sent)
-                for hit_store, hit_part, _ in new_hits:
-                    pairs[f"{hit_store['number']}|{hit_part}"]["alert_pending"] = not delivered
-                notices.clear()
             first_ok = False
-            if cached_source:
-                infos = [info for store in stores for info in store["parts"].values()]
-                st["source_last_checked_ms"] = min(info["last_checked_ms"] for info in infos)
-                st["source_cycle"] = min(info["source_cycle"] for info in infos)
-            audit("poll_ok", source_cycle=st.get("source_cycle"),
-                  source_last_checked_ms=st.get("source_last_checked_ms"), counts=counts)
             log("本轮：有货 {available}，无货 {unavailable}，未开放 {ineligible}，查不到 {unknown}".format(**counts))
             st.update({
                 "pairs": pairs, "last_ok_at": now_str(), "last_counts": counts,
@@ -671,17 +597,9 @@ def watch(cfg: dict) -> None:
             })
             st.pop("last_error", None)
             save_state(st)
-        if cached_source and notices:
-            flush_notices(cfg, notices)
         if blocked:
             log(f"被官网拦截，暂停 {BLOCK_COOLDOWN // 60} 分钟后再查")
             time.sleep(BLOCK_COOLDOWN)
-        elif cached_source:
-            deadline += interval
-            if deadline <= time.monotonic():
-                # Skip missed slots after sleep/network delay; never catch up in a burst.
-                deadline += (int((time.monotonic() - deadline) // interval) + 1) * interval
-            time.sleep(max(0, deadline - time.monotonic()))
         else:
             time.sleep(max(5, interval * random.uniform(0.9, 1.1) - (time.time() - tick)))
 
@@ -740,8 +658,7 @@ def health_report() -> tuple[bool, list[str]]:
     cfg = load_config()
     st = load_state()
     interval = max(MIN_INTERVAL, int(cfg.get("interval", 60)))
-    cached_source = cfg.get("source") == "public_cache"
-    stale_after = 2 * interval + 30 if cached_source else max(5 * interval, BLOCK_COOLDOWN + 5 * interval)
+    stale_after = max(5 * interval, BLOCK_COOLDOWN + 5 * interval)  # 被拦截会停 15 分钟，留出余量
     problems: list[str] = []
     notes: list[str] = []
     pid = running_pid()
@@ -758,13 +675,7 @@ def health_report() -> tuple[bool, list[str]]:
             problems.append(f"数据已经 {int(age // 60)} 分钟没更新（上次 {last_ok}）")
         else:
             notes.append(f"数据在更新（上次 {last_ok}）")
-    if cached_source:
-        stamp = st.get("source_last_checked_ms")
-        if not stamp or time.time() - stamp / 1000 > 120:
-            problems.append("服务器库存已过期或尚未成功更新，当前库存未知")
-        else:
-            notes.append("服务器库存查询时间新鲜")
-    if st.get("last_error") and st.get("fail_count", 0) >= (1 if cached_source else 3):
+    if st.get("last_error") and st.get("fail_count", 0) >= 3:
         problems.append(f"连续 {st['fail_count']} 次查不到：{st['last_error']}")
     try:
         tail = (home() / "watch.log").read_text(encoding="utf-8").splitlines()[-200:]
@@ -794,10 +705,7 @@ def cmd_status(_: argparse.Namespace) -> None:
     print("运行状态：" + (f"运行中（进程 {pid}）" if pid else "没有在运行"))
     print(f"城市：{'、'.join(cfg.get('cities') or []) or cfg.get('location') or '未指定'}  门店数：{len(cfg.get('stores') or []) or '按地点'}")
     print(f"型号：{'、'.join(cfg['parts'].values())}")
-    print(f"间隔：{cfg.get('interval', 60)} 秒  手机推送：{'已设置' if cfg.get('bark') else '未设置'}")
-    print("库存来源：" + ("公开只读 HTTPS 缓存（无需服务器凭据）" if cfg.get("source") == "public_cache" else "官网直查"))
-    if st.get("source_last_checked_ms"):
-        print("服务器实际查询时间：" + datetime.fromtimestamp(st["source_last_checked_ms"] / 1000).strftime("%Y-%m-%d %H:%M:%S"))
+    print(f"间隔：{cfg.get('interval', 60)} 秒  手机推送：{mask(cfg.get('bark', ''))}")
     print(f"上次查到数据：{st.get('last_ok_at', '还没有')}")
     if st.get("last_error"):
         print(f"最近一次查不到：{st.get('last_error_at')}，{st['last_error']}（连续 {st.get('fail_count', 0)} 次）")
@@ -863,47 +771,7 @@ def cmd_stores(a: argparse.Namespace) -> None:
         print(f"{s['number']}\t{city}\t{s['name']}\t{s['address']}")
 
 
-def try_init_public_cache(a: argparse.Namespace) -> bool:
-    from public_cache import SUPPORTED_PARTS, supports
-    requested = getattr(a, "source", "auto")
-    if requested == "direct":
-        return False
-    cities = [c.strip().rstrip("市") for c in (a.city or [])]
-    stores = [n.upper() for n in (a.store or [])]
-    local_scope = (cities == ["大连"] and (not stores or stores == ["R609"])) or (not cities and stores == ["R609"])
-    family_ok = bool(a.family and family_slug(a.family) == "iphone-duo")
-    parts_ok = bool(a.part and all(p.strip().upper() in SUPPORTED_PARTS for p in a.part))
-    if not local_scope or not (family_ok or parts_ok) or a.location:
-        if requested == "cache":
-            raise QueryError("共享缓存当前仅支持大连恒隆 iPhone Duo；未进行官网直查。其他范围可明确选择 --source direct")
-        return False
-    if family_ok:
-        catalog = []
-        for part, title in SUPPORTED_PARTS.items():
-            model, capacity, color = split_title(title)
-            catalog.append({"part": part, "model": model, "capacity": capacity, "color": color})
-        chosen = select_parts(catalog, a.model, a.capacity or [], a.color or [])
-        names = {row["part"]: SUPPORTED_PARTS[row["part"]] for row in chosen}
-    else:
-        names = {part.strip().upper(): SUPPORTED_PARTS[part.strip().upper()] for part in a.part}
-    old = json.loads(config_path().read_text(encoding="utf-8")) if config_path().exists() else {}
-    cfg = {"source": "public_cache", "location": "", "cities": ["大连"], "stores": ["R609"],
-           "parts": names, "interval": max(60, a.interval),
-           "bark": a.bark if a.bark is not None else old.get("bark", ""),
-           "buy_url": a.buy_url or BASE + "/shop/buy-iphone/iphone-duo",
-           "local_notify": not a.no_local_notify}
-    if not supports(cfg):
-        raise QueryError("共享缓存配置不在支持范围内")
-    save_config(cfg)
-    state_path().unlink(missing_ok=True)
-    print("已配置大连恒隆 Duo：每 60 秒读取公开只读 HTTPS 缓存，无需服务器账号、密钥或代理。")
-    print("通知地址仅保存在本机；缓存不可用时显示查不到，不自动回退官网。")
-    return True
-
-
 def cmd_init(a: argparse.Namespace) -> None:
-    if try_init_public_cache(a):
-        return
     names: dict[str, str] = {}
     if a.family:
         slug = family_slug(a.family)
@@ -950,7 +818,6 @@ def cmd_init(a: argparse.Namespace) -> None:
         sys.exit(f"按你给的城市或门店过滤后一家都不剩。这个地点能查到的城市有：{all_cities}")
     old = json.loads(config_path().read_text(encoding="utf-8")) if config_path().exists() else {}
     cfg = {
-        "source": "direct",
         "location": a.location,
         "cities": a.city or [],
         "stores": [s.upper() for s in (a.store or [])],
@@ -965,7 +832,7 @@ def cmd_init(a: argparse.Namespace) -> None:
     print("配置已保存。")
     print(f"监控门店（{len(kept)} 家）：" + "、".join(f"{s['city']} {s['name']}" for s in kept))
     print("监控型号：" + "、".join(cfg["parts"].values()))
-    print("手机推送：" + ("已设置" if cfg.get("bark") else "未设置"))
+    print(f"手机推送：{mask(cfg['bark'])}")
 
 
 def cmd_check(_: argparse.Namespace) -> None:
@@ -1012,7 +879,6 @@ def main() -> None:
     p.set_defaults(fn=cmd_stores)
 
     p = sub.add_parser("init", help="写入监控配置")
-    p.add_argument("--source", choices=["auto", "cache", "direct"], default="auto", help="默认在支持范围内用共享缓存，其他范围保留官网直查；缓存失败不回退")
     p.add_argument("--location", help="省 市 区（一般不用，给 --city 即可自动算出）")
     p.add_argument("--city", action="append", help="城市名；不给 --location 时只给一个")
     p.add_argument("--store", action="append", help="只看这些门店编号，可重复")

@@ -5,7 +5,7 @@ description: 监控 Apple Store 中国大陆门店的到店取货库存，有货
 
 # Apple 库存监控
 
-替用户盯 Apple Store 门店的到店取货库存：在已覆盖范围内读取共享缓存，其他范围使用原官网查询；从没货变有货时推到手机。全部操作通过 `scripts/apple_stock.py` 完成，只用 Python 标准库，不需要安装任何东西。
+替用户盯 Apple Store 门店的到店取货库存：定时查官网，从没货变有货时推到手机。全部操作通过 `scripts/apple_stock.py` 完成，只用 Python 标准库，不需要安装任何东西。
 
 用户多半不懂技术。全程用大白话，不让用户接触命令、型号代码、门店编号；这些你自己处理。
 
@@ -17,16 +17,6 @@ description: 监控 Apple Store 中国大陆门店的到店取货库存，有货
 - 查不到不等于无货。脚本报“查不到”时照实告诉用户，不要说成无货。
 - Bark 推送地址相当于密码：只写进配置，不在回复里复述，不发到别处。
 - 数据只覆盖中国大陆官网（apple.com.cn）的到店取货，不代表线上送货的库存。
-
-## 共享服务与安全边界
-
-- 当前共享缓存仅覆盖**大连恒隆广场的 iPhone Duo 全颜色、全容量**，支持用户选择其中任意配置；不得声称全国共享库存服务已上线。
-- 所有安装者通过固定只读 HTTPS 地址读取，不需要服务器账号、SSH、密钥、代理或共享 token。Bark 在用户自己的电脑上发送，不上传服务端。
-- 初始化默认 `--source auto`：支持范围自动用共享缓存；其他范围明确告诉用户仍是官网直查。`--source cache` 强制共享缓存；不支持的范围直接说明，不能偷偷直查。
-- 共享缓存的读取间隔不低于 60 秒（默认 60 秒）；正常运行约一分钟一轮。服务器实际查询可能受抖动、退避影响，显示实际查询时间，不能把缓存读取时间当成查询时间。
-- 共享模式遇到未知、过期、不可用或限流时显示查不到，等待下一轮，不自动回退官网、不立即重试。重复读取同一份缓存不能当成两次独立无货确认。
-- 原有已保存配置继续原来的查询来源；需切到共享服务时先停原监控，再按同样选择重新 `init --source cache`。不自动覆盖用户配置。
-- 不修改服务器配置，不索要服务器权限，不分发任何管理凭据。更多安全说明见 [SECURITY.md](SECURITY.md)。
 
 ## 引导流程
 
@@ -81,27 +71,13 @@ AppleCare、以旧换新这些不影响库存，不要问。
 
 先用一句话复述：“盯【城市】的【几家店】，【机型 容量 颜色】，有货推到你手机。对吗？”用户确认后：
 
-大连恒隆 Duo 可直接使用共享缓存初始化，不先查询苹果库存：
-
-```bash
-python3 scripts/apple_stock.py init --source cache --city 大连 --family iphone-duo --store R609 \
-  --bark "用户给的 Bark 地址"
-```
-
-其他城市或机型仍按原流程直查，不承诺绕过官网拦截：
-
 ```bash
 python3 scripts/apple_stock.py init --city 深圳 \
   --family iphone-duo --capacity 256GB --color 星光白色 \
   --bark "用户给的 Bark 地址"
 
-```
-
-两种初始化方式都要执行以下步骤（共享模式的 check 只读缓存，不额外查苹果）：
-
-```bash
-python3 scripts/apple_stock.py check
-python3 scripts/apple_stock.py notify-test
+python3 scripts/apple_stock.py check         # 立刻查一次
+python3 scripts/apple_stock.py notify-test   # 发一条测试通知
 ```
 
 - `--family` 用第 2 步的机型名（`iphone-duo` 这种）。选购页里有两个机型时加 `--model "iPhone 18 Pro Max"`。
@@ -159,8 +135,8 @@ python3 scripts/apple_stock.py health --alert
 ## 通知规则
 
 - 某家店某个配置从没货变成有货：立刻推一条，带购买链接。
-- 共享缓存模式同一轮变化合并为最多一条通知；直查模式超过 5 处同时有货时汇总。
-- 有货之后连续两次独立库存查询确认没货：推一条“没货了，持续约几分钟”，静音级别。
+- 同一轮超过 5 处同时有货：合并成一条汇总。
+- 有货之后连续两轮没货：推一条“没货了，持续约几分钟”，静音级别。
 - 连续查不到满 10 分钟：推一条提醒，每小时最多一次；恢复后再推一条。
 
 ## 运行环境
@@ -175,6 +151,4 @@ python3 scripts/apple_stock.py health --alert
 
 ```bash
 python3 tests/test_transitions.py
-python3 tests/test_public_cache.py
-python3 tests/test_cache_monitor.py
 ```
