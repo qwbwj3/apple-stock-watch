@@ -7,3 +7,7 @@ config.json
 state.json
 watch.log
 watch.pid
+events.jsonl*
+.ssh/
+*.pem
+*.key
